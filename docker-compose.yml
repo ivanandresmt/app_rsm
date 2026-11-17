@@ -1,0 +1,97 @@
+name: trip-planner
+
+x-backend: &backend
+  build: ./backend
+  env_file: [.env]
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rsm}:${POSTGRES_PASSWORD:-rsm}@postgres:5432/${POSTGRES_DB:-rsm}
+    PROVIDER_BASE_URL: http://mock-provider:4010/v1
+    STORAGE_DIR: /data/documents
+    MCP_URL: http://mcp:8001/mcp
+  restart: unless-stopped
+
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rsm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rsm}
+      POSTGRES_DB: ${POSTGRES_DB:-rsm}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rsm} -d ${POSTGRES_DB:-rsm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mock-provider:
+    build: ./mock_provider
+    environment:
+      MOCK_DB_PATH: /data/mock.db
+      PROVIDER_TOKENS: ${PROVIDER_TOKEN:-travel-demo-token}
+      CONTROL_TOKEN: ${CONTROL_TOKEN:-control-demo-token}
+      QUOTE_TTL_SECONDS: ${QUOTE_TTL_SECONDS:-900}
+    ports: ["4010:4010"]
+    volumes: [mockdata:/data]
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    ports: ["8000:8000"]
+    volumes: [documents:/data/documents]
+    depends_on:
+      postgres: {condition: service_healthy}
+      mock-provider: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/readyz', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 25s
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "app.worker"]
+    volumes: [documents:/data/documents]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,os; s=socket.create_connection(('postgres',5432),3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 30s  # SIGTERM lets the current job finish; a killed job is recovered by lease expiry
+
+  mcp:
+    <<: *backend
+    command: ["python", "-m", "app.mcp_server"]
+    environment:
+      <<: *backend-env
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8001"
+    ports: ["8001:8001"]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/healthz', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports: ["${FRONTEND_PORT:-3000}:3000"]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mockdata:
+  documents:
